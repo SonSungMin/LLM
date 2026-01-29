@@ -22,7 +22,7 @@ namespace DevTools.UI.Control
     public partial class AIChat : UserControlBase
     {
         private const string EYE_MODEL = "qwen2-vl";
-        private const string BRAIN_MODEL = "deepseek-v2";//"qwen-coder-7b";
+        private const string BRAIN_MODEL = "qwen-coder-7b";//"deepseek-v2"//"deepseek-r1-8b";
         private const string OLLAMA_URL = "http://localhost:11434/api/generate";
 
         private static readonly HttpClient client = new HttpClient();
@@ -66,7 +66,14 @@ namespace DevTools.UI.Control
                 string attContent = txtAttFile.Text;
 
                 txtResult.Text = "";
+
                 string systemPrompt = chkUsePrompt.Checked ? txtSystemPrompt.Text : "";
+                if (string.IsNullOrWhiteSpace(systemPrompt))
+                {
+                    // 시스템 프롬프트가 없으면 기본값 설정
+                    //systemPrompt = "You are a helpful AI assistant. You answer questions kindly and accurately.";
+                    systemPrompt = "You are an expert Senior Software Engineer specializing in C#.\r\nAnalyze the code logic strictly, find potential bugs, and suggest improvements.\r\nThink step-by-step.\r\nTranslate all your responses into Korean.";
+                }
 
                 // -------------------------------------------------------
                 // 시나리오 A: 이미지가 있는 경우 (이미지 분석 -> 뇌 전달)
