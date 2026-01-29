@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -26,7 +27,10 @@ namespace DevTools.UI.Control
         private const string OLLAMA_URL = "http://localhost:11434/api/generate";
         private int _currentMaxToken = 8192;
 
-        // [추가] 모델별 권장 컨텍스트 크기 매핑 (키워드 매칭)
+        // GPU 모니터링용 타이머
+        private Timer _gpuTimer;
+
+        // 모델별 권장 컨텍스트 크기 매핑 (키워드 매칭)
         private readonly Dictionary<string, int> _modelTokenLimits = new Dictionary<string, int>
         {
             { "qwen2.5", 32768 },      // Qwen2.5는 긴 문맥 지원 (VRAM 충분 시)
@@ -46,14 +50,86 @@ namespace DevTools.UI.Control
             InitializeComponent();
             client.Timeout = TimeSpan.FromMinutes(10);
 
-            // [초기 설정] 프로그레스바 정지 및 숨김
             if (mproAiThink != null)
             {
-                mproAiThink.Properties.Stopped = true; // 멈춤
-                mproAiThink.Visible = false;           // 숨김 (선택 사항)
+                mproAiThink.Properties.Stopped = true;
+                mproAiThink.Visible = false;
             }
 
             LoadModelsToComboBox();
+
+            // [추가] GPU 모니터링 타이머 설정 (2초마다 갱신)
+            _gpuTimer = new Timer();
+            _gpuTimer.Interval = 2000; 
+            _gpuTimer.Tick += GpuTimer_Tick;
+            _gpuTimer.Start();
+        }
+
+        private void GpuTimer_Tick(object sender, EventArgs e)
+        {
+            // 백그라운드에서 실행 (UI 스레드 블로킹 방지)
+            Task.Run(() =>
+            {
+                var info = GetNvidiaGpuInfo();
+        
+                // UI 업데이트
+                this.Invoke(new Action(() =>
+                {
+                    if (info.MemoryTotal > 0)
+                    {
+                        //prgGpuUsage.EditValue = info.CoreLoad; 
+                        // 또는 VRAM 사용량을 보여주고 싶다면:
+                        prgGpuUsage.EditValue = (int)((double)info.MemoryUsed / info.MemoryTotal * 100);
+                
+                        // 디버깅용 텍스트 출력 (필요 시 라벨에 연결)
+                        // lblGpuStatus.Text = $"GPU: {info.CoreLoad}% | VRAM: {info.MemoryUsed}MB / {info.MemoryTotal}MB";
+                
+                        // [구현할 프로그레스바 연동 예시]
+                        //prgGpuUsage.Position = info.CoreLoad; // 사용률 표시
+                    }
+                }));
+            });
+        }
+
+        private GpuInfo GetNvidiaGpuInfo()
+        {
+            GpuInfo info = new GpuInfo();
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "nvidia-smi",
+                    // 출력 형식: load, memory.used, memory.total
+                    Arguments = "--query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using (Process process = Process.Start(psi))
+                {
+                    using (System.IO.StreamReader reader = process.StandardOutput)
+                    {
+                        string result = reader.ReadToEnd();
+                        // 결과 예시: "45, 6000, 8192"
+                        if (!string.IsNullOrWhiteSpace(result))
+                        {
+                            string[] parts = result.Split(',');
+                            if (parts.Length >= 3)
+                            {
+                                int.TryParse(parts[0].Trim(), out info.CoreLoad);
+                                int.TryParse(parts[1].Trim(), out info.MemoryUsed);
+                                int.TryParse(parts[2].Trim(), out info.MemoryTotal);
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // nvidia-smi가 없거나 오류 발생 시 무시 (0 반환)
+            }
+            return info;
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -170,15 +246,15 @@ You are an expert Senior Full Stack Engineer and Database Architect.
 You possess deep knowledge of C#, Python, Vue.js, Oracle, and System Architecture.
 
 [Instructions]
-1.  **Analyze Deeply**: Before answering, you MUST think step-by-step about the code's logic, potential edge cases, and performance implications.
-2.  **Reasoning Process**: Output your thinking process inside <think> tags in English. This helps you verify your logic.
+1.  **Analyze Intent**: First, determine if the user's input is a **Technical Question** (code, bug fix, architecture) or a **General Conversation** (greeting, self-intro, non-technical).
+2.  **Reasoning Process**: Output your thinking process inside <think> tags in English.
 3.  **Final Output**: After thinking, provide the final response strictly in **Professional Korean**.
-    - Explain the solution clearly.
-    - Provide corrected or optimized code blocks.
+    - **If Technical**: Explain the solution clearly and provide corrected or optimized code blocks.
+    - **If General Conversation**: Answer naturally and politely. **DO NOT** provide code blocks unless explicitly requested.
     - Do NOT mix English in the final Korean explanation unless it is a technical term.
 
 [Goal]
-Your goal is to provide the most accurate, secure, and optimized solution for maintaining and improving legacy systems.
+Your goal is to provide the most accurate technical solutions or be a helpful assistant depending on the user's need.
 ";
                         }
                         // Qwen 및 그 외
@@ -199,7 +275,9 @@ Translate all your responses into professional Korean.";
                         }
                     }
                     _chatHistory.Add(new { role = "system", content = systemPrompt });
-                    
+
+                    txtSystemPrompt.Text = systemPrompt;
+
                     // 시작 알림
                     PrintChatMessage("System", $"대화를 시작합니다. (Context Limit: {_currentMaxToken} Tokens)");
                 }
@@ -301,6 +379,7 @@ Translate all your responses into professional Korean.";
             Document doc = txtResult.Document;
             doc.AppendText("\r\n──────────────────────────────────────────────────\r\n");
 
+
             DocumentRange range = doc.AppendText($"[{role}] ");
             CharacterProperties cp = doc.BeginUpdateCharacters(range);
             cp.Bold = true;
@@ -333,7 +412,7 @@ Translate all your responses into professional Korean.";
                 options = new
                 {
                     num_ctx = _currentMaxToken, // 8192
-                    temperature = 0.1,
+                    temperature = 0.6,
                     num_thread = 6
                 }
             };
@@ -533,6 +612,16 @@ Translate all your responses into professional Korean.";
             _currentMaxToken = newLimit;
         }
     }
+
+
+    // GPU 정보 구조체
+    public struct GpuInfo
+    {
+        public int CoreLoad;   // GPU 코어 사용률 (%)
+        public int MemoryUsed; // 사용된 VRAM (MB)
+        public int MemoryTotal;// 전체 VRAM (MB)
+    }
+
 
     public class OllamaModelList
     {
