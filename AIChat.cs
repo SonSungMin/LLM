@@ -21,34 +21,114 @@ namespace DevTools.UI.Control
     [ToolboxItem(true)]
     public partial class AIChat : UserControlBase
     {
-        private const string EYE_MODEL = "qwen2-vl";
-        private const string BRAIN_MODEL = "qwen-coder-7b";//"deepseek-v2"//"deepseek-r1-8b";
+        private string EYE_MODEL = "qwen2-vl";
+        private string BRAIN_MODEL = "deepseek-r1-8b";//"qwen-coder-7b";
         private const string OLLAMA_URL = "http://localhost:11434/api/generate";
+        private int _currentMaxToken = 8192;
+
+        // [추가] 모델별 권장 컨텍스트 크기 매핑 (키워드 매칭)
+        private readonly Dictionary<string, int> _modelTokenLimits = new Dictionary<string, int>
+        {
+            { "qwen2.5", 32768 },      // Qwen2.5는 긴 문맥 지원 (VRAM 충분 시)
+            { "deepseek-r1", 8192 },   // DeepSeek R1 8B 표준
+            { "llama3", 8192 },        // Llama3 표준
+            { "mistral", 32768 },      // Mistral v0.3 등
+            { "gemma", 8192 },         // Gemma 2
+            { "phi", 4096 }            // MS Phi 시리즈 (구버전은 2048일 수 있음)
+        };
 
         private static readonly HttpClient client = new HttpClient();
+        // 대화 맥락(Context) 저장 리스트
+        private List<object> _chatHistory = new List<object>();
 
         public AIChat()
         {
             InitializeComponent();
-            client.Timeout = TimeSpan.FromMinutes(10); // 타임아웃 10분으로 넉넉하게
+            client.Timeout = TimeSpan.FromMinutes(10);
+
+            // [초기 설정] 프로그레스바 정지 및 숨김
+            if (mproAiThink != null)
+            {
+                mproAiThink.Properties.Stopped = true; // 멈춤
+                mproAiThink.Visible = false;           // 숨김 (선택 사항)
+            }
+
+            LoadModelsToComboBox();
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
-            // [Ctrl] + [Enter] 키가 눌렸는지 확인
             if (keyData == (Keys.Control | Keys.Enter))
             {
-                // 버튼이 사용 가능한 상태(분석 중이 아님)일 때만 실행
                 if (btnAnalyze.Enabled)
                 {
-                    // 버튼 클릭 이벤트 강제 호출
                     BtnAnalyze_Click(this, EventArgs.Empty);
-                    return true; // 키 입력을 여기서 처리했음을 시스템에 알림 (딩~ 소리 방지)
+                    return true;
                 }
             }
-
-            // 그 외의 키는 원래대로 처리
             return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        private async void LoadModelsToComboBox()
+        {
+            // 모델 리스트 가져오기
+            var models = await GetOllamaModelsAsync();
+
+            if (models.Count > 0)
+            {
+                cboModelList.Properties.Items.BeginUpdate();
+                try
+                {
+                    cboModelList.Properties.Items.Clear();
+                    foreach (string modelName in models)
+                    {
+                        cboModelList.Properties.Items.Add(new DevExpress.XtraEditors.Controls.ImageComboBoxItem(modelName, modelName, -1));
+                    }
+            
+                    // 첫 번째 항목 선택
+                    cboModelList.SelectedIndex = 0;
+                }
+                finally
+                {
+                    cboModelList.Properties.Items.EndUpdate();
+                }
+            }
+            else
+            {
+                txtResult.Document.AppendText("[알림] 설치된 Ollama 모델을 찾을 수 없습니다.\r\n");
+            }
+        }
+
+        /// <summary>
+        /// Ollama에 설치된 모델 리스트를 가져옵니다.
+        /// </summary>
+        private async Task<List<string>> GetOllamaModelsAsync()
+        {
+            string url = "http://localhost:11434/api/tags";
+
+            try
+            {
+                var response = await client.GetAsync(url);
+                response.EnsureSuccessStatusCode();
+
+                string responseBody = await response.Content.ReadAsStringAsync();
+
+                var options = new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                };
+
+                var modelData = JsonSerializer.Deserialize<OllamaModelList>(responseBody, options);
+
+                // 모델 이름만 추출하여 리스트로 반환
+                return modelData?.Models.Select(m => m.Name).ToList() ?? new List<string>();
+            }
+            catch (Exception ex)
+            {
+                // 오류 시 빈 리스트 반환 혹은 로그 출력
+                System.Diagnostics.Debug.WriteLine($"모델 조회 실패: {ex.Message}");
+                return new List<string>();
+            }
         }
 
         private async void BtnAnalyze_Click(object sender, EventArgs e)
@@ -57,171 +137,215 @@ namespace DevTools.UI.Control
             {
                 this.Cursor = Cursors.WaitCursor;
                 btnAnalyze.Enabled = false;
-                
-                // 1. RichEditControl에서 텍스트와 이미지를 분리 추출
-                var content = ExtractContentFromRichEdit();
 
-                string userPrompt = content.Text;       // 사용자가 적은 글
-                string base64Image = content.ImageBase64; // 사용자가 붙여넣은 이미지 (없으면 null)
+                if (mproAiThink != null)
+                {
+                    mproAiThink.Visible = true;
+                    mproAiThink.Properties.Stopped = false;
+                }
+                
+                // 1. 입력 내용 추출
+                var content = ExtractContentFromRichEdit();
+                string userPrompt = content.Text;       
+                string base64Image = content.ImageBase64; 
                 string attContent = txtAttFile.Text;
 
-                txtResult.Text = "";
-
-                string systemPrompt = chkUsePrompt.Checked ? txtSystemPrompt.Text : "";
-                if (string.IsNullOrWhiteSpace(systemPrompt))
+                if (string.IsNullOrWhiteSpace(userPrompt) && string.IsNullOrEmpty(base64Image))
                 {
-                    // 시스템 프롬프트가 없으면 기본값 설정
-                    //systemPrompt = "You are a helpful AI assistant. You answer questions kindly and accurately.";
-                    systemPrompt = "You are an expert Senior Software Engineer specializing in C#.\r\nAnalyze the code logic strictly, find potential bugs, and suggest improvements.\r\nThink step-by-step.\r\nTranslate all your responses into Korean.";
+                    MessageBox.Show("내용을 입력하거나 이미지를 붙여넣으세요.");
+                    return;
                 }
 
-                // -------------------------------------------------------
-                // 시나리오 A: 이미지가 있는 경우 (이미지 분석 -> 뇌 전달)
-                // -------------------------------------------------------
+                // 2. 시스템 프롬프트 설정 (최초 1회)
+                if (_chatHistory.Count == 0)
+                {
+                    string systemPrompt = chkUsePrompt.Checked ? txtSystemPrompt.Text : "";
+                    if (string.IsNullOrWhiteSpace(systemPrompt))
+                    {
+                        // DeepSeek 용
+                        if (BRAIN_MODEL.ToLower().Contains("deepseek"))
+                        {
+                            systemPrompt = @"
+You are an expert Senior Full Stack Engineer and Database Architect.
+You possess deep knowledge of C#, Python, Vue.js, Oracle, and System Architecture.
+
+[Instructions]
+1.  **Analyze Deeply**: Before answering, you MUST think step-by-step about the code's logic, potential edge cases, and performance implications.
+2.  **Reasoning Process**: Output your thinking process inside <think> tags in English. This helps you verify your logic.
+3.  **Final Output**: After thinking, provide the final response strictly in **Professional Korean**.
+    - Explain the solution clearly.
+    - Provide corrected or optimized code blocks.
+    - Do NOT mix English in the final Korean explanation unless it is a technical term.
+
+[Goal]
+Your goal is to provide the most accurate, secure, and optimized solution for maintaining and improving legacy systems.
+";
+                        }
+                        // Qwen 및 그 외
+                        else
+                        {
+                            systemPrompt = @"
+You are an expert Senior Full Stack Software Engineer and Database Architect.
+Your expertise covers a wide range of technologies including C# (.NET), Python, Front-end (HTML, Vue.js), and Databases (Oracle, ANSI SQL).
+
+Your responsibilities are:
+1. Analyze the user's code or query regardless of the language.
+2. Provide optimized, secure, and clean code solutions.
+3. For Database queries, prioritize performance and explain execution logic.
+4. If a bug is found, explain the root cause and fix it.
+5. Think step-by-step and provide clear technical explanations.
+
+Translate all your responses into professional Korean.";
+                        }
+                    }
+                    _chatHistory.Add(new { role = "system", content = systemPrompt });
+                    
+                    // 시작 알림
+                    PrintChatMessage("System", $"대화를 시작합니다. (Context Limit: {_currentMaxToken} Tokens)");
+                }
+
+                // 3. 첨부 파일 내용 추가
+                if (!string.IsNullOrWhiteSpace(attContent))
+                {
+                    userPrompt += $"\r\n\r\n[Reference File Content]:\r\n{attContent}";
+                }
+
+                // 4. 이미지 처리
                 if (!string.IsNullOrEmpty(base64Image))
                 {
-                    lblStatus.Text = $"[1단계] {EYE_MODEL} 이미지 텍스트 추출 중...";
-                    txtResult.Document.AppendText($"=== [Type: 이미지 + 텍스트] 분석 시작 ===\r\n");
-
-                    // 1-1. 눈(Eye)에게 OCR 요청
-                    string ocrPrompt = @"
-You are a helpful assistant for data entry and documentation.
-Please transcribe the text visible in this software interface screenshot.
-This is for documenting the user interface layout.
-Output the text content exactly as it appears, maintaining the structure.
-";
-
-                    string extractedTextFromImage = await CallOllamaAsync(EYE_MODEL, ocrPrompt, userPrompt, base64Image);
-
-                    txtResult.Document.AppendText($"[추출된 이미지 내용]\r\n{extractedTextFromImage}\r\n\r\n");
-
-                    // 메모리 해제
+                    lblStatus.Text = $"[1단계] {EYE_MODEL} 이미지 분석 중...";
+                    string ocrPrompt = "Please transcribe the text visible in this screenshot exactly.";
+                    
+                    // 이미지 분석 요청 (토큰 계산 불필요하므로 결과만 취함)
+                    var ocrResult = await CallOllamaSingleAsync(EYE_MODEL, null, ocrPrompt, base64Image);
+                    
+                    userPrompt = $"[Image Text]:\r\n{ocrResult.ResponseText}\r\n\r\n[User Question]:\r\n{userPrompt}";
                     await UnloadModel(EYE_MODEL);
-
-                    // 1-2. 뇌(Brain)에게 통합 분석 요청
-                    lblStatus.Text = $"[2단계] {BRAIN_MODEL} 최종 분석 중...";
-
-                    userPrompt = !string.IsNullOrEmpty(extractedTextFromImage) ? $"{extractedTextFromImage}\r\n{userPrompt}" : "";
-
-                    string finalResult = await CallOllamaAsync(BRAIN_MODEL, systemPrompt, userPrompt, null);
-                    txtResult.Document.AppendText($"=== [최종 결과] ===\r\n{finalResult}");
                 }
-                // -------------------------------------------------------
-                // 시나리오 B: 이미지가 없는 경우 (텍스트만 뇌로 전달)
-                // -------------------------------------------------------
+
+                // 5. 사용자 질문 히스토리 추가
+                _chatHistory.Add(new { role = "user", content = userPrompt });
+                PrintChatMessage("User", string.IsNullOrEmpty(base64Image) ? userPrompt : "[이미지 포함 질문] " + userPrompt);
+
+                // 6. 뇌(Brain) 모델 호출
+                lblStatus.Text = $"[2단계] {BRAIN_MODEL} 답변 생성 중...";
+
+                // API 호출 및 토큰 정보 수신
+                var result = await CallOllamaHistoryAsync(BRAIN_MODEL, _chatHistory);
+                
+                if (result.IsSuccess)
+                {
+                    // AI 응답 히스토리 추가
+                    _chatHistory.Add(new { role = "assistant", content = result.ResponseText });
+
+                    // 답변 및 토큰 정보 출력
+                    PrintChatMessage("AI", result.ResponseText);
+                    PrintTokenUsage(result.PromptEvalCount, result.EvalCount);
+                }
                 else
                 {
-                    if (string.IsNullOrWhiteSpace(userPrompt))
-                    {
-                        MessageBox.Show("내용을 입력하거나 이미지를 붙여넣으세요.");
-                        return;
-                    }
-
-                    lblStatus.Text = $"[단일 단계] {BRAIN_MODEL} 텍스트 분석 중...";
-                    txtResult.Document.AppendText($"=== [Type: 텍스트 전용] 분석 시작 ===\r\n");
-                    
-                    txtResult.Document.AppendText($"=== 최종 프롬프트 ===\r\n");
-                    txtResult.Document.AppendText($"[ 시스템 프롬프트 ]\r\n");
-                    txtResult.Document.AppendText(systemPrompt + "\r\n\r\n");
-                    txtResult.Document.AppendText($"[ 사용자 프롬프트 ]\r\n");
-                    txtResult.Document.AppendText(userPrompt + "\r\n\r\n");
-                    txtResult.Document.AppendText($"**********************************************************\r\n");
-
-                    string finalResult = await CallOllamaAsync(BRAIN_MODEL, systemPrompt, userPrompt, null);
-                    txtResult.Document.AppendText(finalResult);
-
-                    txtResult.Document.CaretPosition = txtResult.Document.CreatePosition(txtResult.Document.Range.End.ToInt());
+                    PrintChatMessage("Error", result.ResponseText);
                 }
 
-                // 끝난 후 Brain 모델 메모리 정리
                 await UnloadModel(BRAIN_MODEL);
                 lblStatus.Text = "완료";
+                txtQuest.Document.Text = ""; // 입력창 비우기
             }
             catch (Exception ex)
             {
-                txtResult.Document.AppendText($"\r\n[Error] {ex.Message}");
+                PrintChatMessage("Error", ex.Message);
                 lblStatus.Text = "오류 발생";
             }
             finally
             {
+                if (mproAiThink != null)
+                {
+                    mproAiThink.Properties.Stopped = true; // 애니메이션 멈춤
+                    mproAiThink.Visible = false;           // 숨김 (필요 시 true로 유지)
+                }
+
                 btnAnalyze.Enabled = true;
                 this.Cursor = Cursors.Default;
             }
         }
 
-        private (string Text, string ImageBase64) ExtractContentFromRichEdit()
+        // [신규] 토큰 사용량 출력 메서드
+        private void PrintTokenUsage(int promptTokens, int responseTokens)
         {
-            string text = txtQuest.Document.Text.Trim();
-            string imgBase64 = null;
+            // Ollama는 전체 컨텍스트(이전 대화+현재 질문)를 prompt_eval_count로 반환함
+            int totalUsed = promptTokens + responseTokens;
+            int remaining = _currentMaxToken - totalUsed;
+            double usagePercent = (double)totalUsed / _currentMaxToken * 100;
 
-            var images = txtQuest.Document.Images;
-
-            if (images.Count > 0)
+            string tokenInfo = $"[Token Usage] Used: {totalUsed} / {_currentMaxToken} ({usagePercent:F1}%) | Remaining: {remaining}";
+            
+            Document doc = txtResult.Document;
+            doc.AppendText("\r\n");
+            DocumentRange range = doc.AppendText(tokenInfo);
+            
+            CharacterProperties cp = doc.BeginUpdateCharacters(range);
+            cp.FontSize = 8; // 작게 표시
+            cp.ForeColor = remaining < 1000 ? Color.Red : Color.Gray; // 위험하면 빨간색
+            doc.EndUpdateCharacters(cp);
+            
+            if (remaining < 1000)
             {
-                try
-                {
-                    DocumentImage docImage = images[0];
-
-                    // [오류 수정] 여기에 'using'을 절대 쓰면 안 됩니다!
-                    // 화면에 살아있는 이미지를 참조만 해야 합니다.
-                    Image originalImage = docImage.Image.NativeImage;
-
-                    if (originalImage != null)
-                    {
-                        // 원본은 건드리지 말고, '새 하얀 도화지(Bitmap)'에 복사해서 처리합니다.
-                        // 이렇게 하면 원본 이미지가 보호되어 클릭해도 오류가 안 납니다.
-                        using (Bitmap cleanBitmap = new Bitmap(originalImage.Width, originalImage.Height))
-                        {
-                            using (Graphics g = Graphics.FromImage(cleanBitmap))
-                            {
-                                // 흰 배경 깔기 (투명도 문제 해결)
-                                g.Clear(Color.White);
-                                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-
-                                // 원본 그림을 복사본에 그리기
-                                g.DrawImage(originalImage, 0, 0, originalImage.Width, originalImage.Height);
-                            }
-
-                            // 복사본을 JPEG로 변환
-                            using (MemoryStream ms = new MemoryStream())
-                            {
-                                cleanBitmap.Save(ms, ImageFormat.Jpeg);
-                                imgBase64 = Convert.ToBase64String(ms.ToArray());
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    System.Diagnostics.Debug.WriteLine($"이미지 처리 오류: {ex.Message}");
-                }
+                doc.AppendText("\r\n[Warning] 컨텍스트 용량이 얼마 남지 않았습니다. 대화를 초기화하거나 요약해주세요.");
             }
-
-            return (text, imgBase64);
+            doc.AppendText("\r\n");
+            txtResult.ScrollToCaret();
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="modelName">모델명</param>
-        /// <param name="systemPrompt">시스템 프롬프트</param>
-        /// <param name="userPrompt">사용자 프롬프트</param>
-        /// <param name="base64Image">이미지</param>
-        /// <returns></returns>
-        private async Task<string> CallOllamaAsync(string modelName, string systemPrompt, string userPrompt, string base64Image = null)
+        private void PrintChatMessage(string role, string message)
         {
-            string chatUrl = "http://localhost:11434/api/chat";
+            Document doc = txtResult.Document;
+            doc.AppendText("\r\n──────────────────────────────────────────────────\r\n");
 
-            // 1. 메시지 리스트 동적 구성
-            var messages = new List<object>();
+            DocumentRange range = doc.AppendText($"[{role}] ");
+            CharacterProperties cp = doc.BeginUpdateCharacters(range);
+            cp.Bold = true;
+            if (role == "User") cp.ForeColor = Color.Blue;
+            else if (role == "AI") cp.ForeColor = Color.Green;
+            else if (role == "Error") cp.ForeColor = Color.Red;
+            doc.EndUpdateCharacters(cp);
 
-            // 시스템 프롬프트가 있다면 맨 앞에 추가
-            if (!string.IsNullOrWhiteSpace(systemPrompt))
+            doc.AppendText($"\r\n{message}\r\n");
+            txtResult.Document.CaretPosition = txtResult.Document.CreatePosition(txtResult.Document.Range.End.ToInt());
+            txtResult.ScrollToCaret();
+        }
+
+        // 결과 반환용 클래스
+        private class OllamaResponse
+        {
+            public bool IsSuccess { get; set; }
+            public string ResponseText { get; set; }
+            public int PromptEvalCount { get; set; } // 입력+히스토리 토큰 수
+            public int EvalCount { get; set; }       // 답변 토큰 수
+        }
+
+        private async Task<OllamaResponse> CallOllamaHistoryAsync(string modelName, List<object> historyMessages)
+        {
+            var requestData = new
             {
-                messages.Add(new { role = "system", content = systemPrompt });
-            }
+                model = modelName,
+                messages = historyMessages,
+                stream = false,
+                options = new
+                {
+                    num_ctx = _currentMaxToken, // 8192
+                    temperature = 0.1,
+                    num_thread = 6
+                }
+            };
 
-            // 사용자 메시지 구성 (이미지 포함 여부 체크)
+            return await SendOllamaRequest("http://localhost:11434/api/chat", requestData);
+        }
+
+        private async Task<OllamaResponse> CallOllamaSingleAsync(string modelName, string systemPrompt, string userPrompt, string base64Image = null)
+        {
+            var messages = new List<object>();
+            if (!string.IsNullOrWhiteSpace(systemPrompt)) messages.Add(new { role = "system", content = systemPrompt });
+            
             var userMessage = new
             {
                 role = "user",
@@ -230,126 +354,137 @@ Output the text content exactly as it appears, maintaining the structure.
             };
             messages.Add(userMessage);
 
-            // 2. 요청 데이터 구성
             var requestData = new
             {
                 model = modelName,
                 messages = messages,
                 stream = false,
-                options = new
-                {
-                    num_ctx = 8192,    // 코딩 작업은 컨텍스트가 길어야 하므로 8192 권장
-                    temperature = 0.1, // 코딩 정확도를 위해 낮춤
-                    top_p = 0.9,
-                    repeat_penalty = 1.1,
-                    num_thread = 5
-                }
+                options = new { num_ctx = _currentMaxToken, temperature = 0.1 }
             };
 
-            // 3. JSON 직렬화 옵션 (CamelCase 변환 및 Null 무시)
-            var jsonOptions = new JsonSerializerOptions
-            {
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-                WriteIndented = false
-            };
+            return await SendOllamaRequest("http://localhost:11434/api/chat", requestData);
+        }
 
+        private async Task<OllamaResponse> SendOllamaRequest(string url, object requestData)
+        {
+            var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
             string jsonContent = JsonSerializer.Serialize(requestData, jsonOptions);
             var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
             try
             {
-                // 4. 요청 전송 (client는 외부에서 주입받거나 static으로 관리 권장)
-                HttpResponseMessage response = await client.PostAsync(chatUrl, content);
+                HttpResponseMessage response = await client.PostAsync(url, content);
+                string responseBody = await response.Content.ReadAsStringAsync();
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    string errorInfo = await response.Content.ReadAsStringAsync();
-                    return $"[서버 오류 {response.StatusCode}] {errorInfo}";
+                    return new OllamaResponse { IsSuccess = false, ResponseText = $"[서버 오류 {response.StatusCode}] {responseBody}" };
                 }
 
-                string responseBody = await response.Content.ReadAsStringAsync();
-
-                // 5. 응답 파싱
                 using (JsonDocument doc = JsonDocument.Parse(responseBody))
                 {
-                    if (doc.RootElement.TryGetProperty("message", out JsonElement messageElement) &&
-                        messageElement.TryGetProperty("content", out JsonElement contentElement))
+                    var root = doc.RootElement;
+                    string text = "";
+                    
+                    if (root.TryGetProperty("message", out JsonElement msg) && msg.TryGetProperty("content", out JsonElement cnt))
                     {
-                        return contentElement.GetString();
+                        text = cnt.GetString();
                     }
-                    else
-                    {
-                        return $"[응답 형식 오류] 예상된 'message.content' 필드가 없습니다.\n{responseBody}";
-                    }
+                    
+                    // 토큰 정보 추출
+                    int pEval = root.TryGetProperty("prompt_eval_count", out JsonElement pec) ? pec.GetInt32() : 0;
+                    int eval = root.TryGetProperty("eval_count", out JsonElement ec) ? ec.GetInt32() : 0;
+
+                    return new OllamaResponse { IsSuccess = true, ResponseText = text, PromptEvalCount = pEval, EvalCount = eval };
                 }
-            }
-            catch (TaskCanceledException)
-            {
-                return "[시간 초과] 모델 응답이 너무 늦습니다. (Timeout 설정을 확인하세요)";
-            }
-            catch (HttpRequestException ex)
-            {
-                return $"[연결 실패] Ollama가 실행 중인지 확인하세요. (http://localhost:11434)\n{ex.Message}";
             }
             catch (Exception ex)
             {
-                return $"[예외 발생] {ex.Message}";
+                return new OllamaResponse { IsSuccess = false, ResponseText = $"[예외 발생] {ex.Message}" };
             }
+        }
+
+        private (string Text, string ImageBase64) ExtractContentFromRichEdit()
+        {
+            string text = txtQuest.Document.Text.Trim();
+            string imgBase64 = null;
+            var images = txtQuest.Document.Images;
+
+            if (images.Count > 0)
+            {
+                try
+                {
+                    DocumentImage docImage = images[0];
+                    Image originalImage = docImage.Image.NativeImage;
+                    if (originalImage != null)
+                    {
+                        using (Bitmap cleanBitmap = new Bitmap(originalImage.Width, originalImage.Height))
+                        {
+                            using (Graphics g = Graphics.FromImage(cleanBitmap))
+                            {
+                                g.Clear(Color.White);
+                                g.DrawImage(originalImage, 0, 0, originalImage.Width, originalImage.Height);
+                            }
+                            using (MemoryStream ms = new MemoryStream())
+                            {
+                                cleanBitmap.Save(ms, ImageFormat.Jpeg);
+                                imgBase64 = Convert.ToBase64String(ms.ToArray());
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            return (text, imgBase64);
         }
 
         private async Task UnloadModel(string modelName)
         {
-            var requestData = new { model = modelName, keep_alive = 0 };
-            var content = new StringContent(JsonSerializer.Serialize(requestData), Encoding.UTF8, "application/json");
-            await client.PostAsync(OLLAMA_URL, content);
+            try
+            {
+                var requestData = new { model = modelName, keep_alive = 0 };
+                var content = new StringContent(JsonSerializer.Serialize(requestData), Encoding.UTF8, "application/json");
+                await client.PostAsync(OLLAMA_URL, content);
+            }
+            catch { }
+        }
+        
+        // 초기화 버튼 연결용 (Designer에서 버튼 클릭 이벤트에 연결하세요)
+        private void btnResetChat_Click(object sender, EventArgs e)
+        {
+            _chatHistory.Clear();
+            txtResult.Text = "";
+            PrintChatMessage("System", "대화 내용이 초기화되었습니다.");
         }
 
+        // 파일 처리 관련 기존 코드 유지 (btnOpenFile_Click, btnRemoveFile_Click, UpdateFileCont)
         private void btnOpenFile_Click(object sender, EventArgs e)
         {
             using (OpenFileDialog openFileDialog = new OpenFileDialog())
             {
-                openFileDialog.InitialDirectory = @"E:\DevProject\SM48";
-                openFileDialog.Multiselect = true;             // 멀티 선택 활성화
-                openFileDialog.Title = "파일을 선택하세요";     // 창 제목
-                openFileDialog.Filter = "모든 파일 (*.*)|*.*"; // 파일 필터
-
-                // 2. 파일 선택 창 열기
+                openFileDialog.Multiselect = true;
+                openFileDialog.Title = "파일을 선택하세요";
+                openFileDialog.Filter = "모든 파일 (*.*)|*.*";
                 if (openFileDialog.ShowDialog() == DialogResult.OK)
                 {
-                    // 3. 선택된 파일 경로들을 ListBox에 누적
                     foreach (string filePath in openFileDialog.FileNames)
                     {
-                        // 중복된 경로가 없는 경우에만 추가 (선택 사항)
-                        if (!lstFiles.Items.Contains(filePath))
-                        {
-                            lstFiles.Items.Add(filePath);
-                        }
+                        if (!lstFiles.Items.Contains(filePath)) lstFiles.Items.Add(filePath);
                     }
                 }
             }
-
             UpdateFileCont();
         }
 
         private void btnRemoveFile_Click(object sender, EventArgs e)
         {
-            // 1. 선택된 아이템이 있는지 확인
             if (lstFiles.SelectedItems.Count > 0)
             {
-                // 2. 뒤에서부터 삭제해야 인덱스가 변하지 않음
-                // SelectedIndices를 사용해 선택된 위치의 번호들을 가져옵니다.
                 for (int i = lstFiles.SelectedIndices.Count - 1; i >= 0; i--)
                 {
-                    int indexToRemove = lstFiles.SelectedIndices[i];
-                    lstFiles.Items.RemoveAt(indexToRemove);
+                    lstFiles.Items.RemoveAt(lstFiles.SelectedIndices[i]);
                 }
-
                 UpdateFileCont();
-            }
-            else
-            {
-                MessageBox.Show("삭제할 파일을 리스트에서 선택해주세요.", "알림", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -361,39 +496,53 @@ Output the text content exactly as it appears, maintaining the structure.
             {
                 foreach (string filePath in lstFiles.Items)
                 {
-                    Document doc = txtAttFile.Document;
-
                     if (File.Exists(filePath))
                     {
-                        // 파일 내용 읽기
                         string fileContent = File.ReadAllText(filePath);
-
-                        //// 3. 문서 끝에 파일명 구분선 추가 (선택 사항)
-                        //DocumentRange headerRange = doc.AppendText($"\n--- File: {Path.GetFileName(filePath)} ---\n");
-
-                        //// 구분선에 볼드체 서식 적용 예시
-                        //CharacterProperties cp = doc.BeginUpdateCharacters(headerRange);
-                        //cp.Bold = true;
-                        //doc.EndUpdateCharacters(cp);
-
-                        // 4. 본문 내용 누적
-                        doc.AppendText(fileContent);
-                        doc.AppendText("\n\n\n"); // 파일 간 간격을 위한 줄바꿈
+                        txtAttFile.Document.AppendText($"\n--- File: {Path.GetFileName(filePath)} ---\n");
+                        txtAttFile.Document.AppendText(fileContent);
+                        txtAttFile.Document.AppendText("\n\n");
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"오류 발생: {ex.Message}");
-            }
+            catch { }
             finally
             {
-                // 5. 업데이트 종료 및 화면 갱신
                 txtAttFile.EndUpdate();
-
-                // 스크롤을 문서 끝으로 이동
                 txtAttFile.ScrollToCaret();
             }
         }
+
+        private void cboModelList_EditValueChanged(object sender, EventArgs e)
+        {
+            if (cboModelList.EditValue == null) return;
+
+            string selectedModel = BRAIN_MODEL = cboModelList.EditValue.ToString().ToLower();
+
+            // 딕셔너리에서 키워드 검색 (기본값 8192)
+            int newLimit = 8192;
+            foreach (var kvp in _modelTokenLimits)
+            {
+                if (selectedModel.Contains(kvp.Key))
+                {
+                    newLimit = kvp.Value;
+                    break;
+                }
+            }
+
+            _currentMaxToken = newLimit;
+        }
+    }
+
+    public class OllamaModelList
+    {
+        [JsonPropertyName("models")]
+        public List<OllamaModelInfo> Models { get; set; }
+    }
+
+    public class OllamaModelInfo
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; }
     }
 }
