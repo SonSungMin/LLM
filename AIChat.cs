@@ -53,7 +53,7 @@ namespace DevTools.UI.Control
             if (mproAiThink != null)
             {
                 mproAiThink.Properties.Stopped = true;
-                mproAiThink.Visible = false;
+                layAiThink.Visibility = DevExpress.XtraLayout.Utils.LayoutVisibility.Never;
             }
 
             LoadModelsToComboBox();
@@ -67,25 +67,27 @@ namespace DevTools.UI.Control
 
         private void GpuTimer_Tick(object sender, EventArgs e)
         {
-            // 백그라운드에서 실행 (UI 스레드 블로킹 방지)
             Task.Run(() =>
             {
                 var info = GetNvidiaGpuInfo();
-        
-                // UI 업데이트
+
                 this.Invoke(new Action(() =>
                 {
+                    // 데이터 수신 성공 시
                     if (info.MemoryTotal > 0)
                     {
-                        //prgGpuUsage.EditValue = info.CoreLoad; 
-                        // 또는 VRAM 사용량을 보여주고 싶다면:
-                        prgGpuUsage.EditValue = (int)((double)info.MemoryUsed / info.MemoryTotal * 100);
+                        // 1. 프로그레스바: GPU 코어 사용률 (0~100)
+                        prgGpuUsage.EditValue = info.CoreLoad; 
                 
-                        // 디버깅용 텍스트 출력 (필요 시 라벨에 연결)
-                        // lblGpuStatus.Text = $"GPU: {info.CoreLoad}% | VRAM: {info.MemoryUsed}MB / {info.MemoryTotal}MB";
-                
-                        // [구현할 프로그레스바 연동 예시]
-                        //prgGpuUsage.Position = info.CoreLoad; // 사용률 표시
+                        // 2. 타이틀/텍스트: VRAM 정보 표시
+                        // (사용하시는 컨트롤 속성에 맞게 주석 해제하여 사용하세요)
+                        prgGpuUsage.Text = $"VRAM: {info.MemoryUsed} / {info.MemoryTotal} MB"; 
+                        // groupControl1.Text = $"GPU Load: {info.CoreLoad}% | VRAM: {info.MemoryUsed}/{info.MemoryTotal}MB";
+                    }
+                    else
+                    {
+                        // [디버깅] 데이터를 못 가져오는 경우 텍스트로 표시
+                        // prgGpuUsage.Text = "NVIDIA GPU 인식 불가";
                     }
                 }));
             });
@@ -96,9 +98,24 @@ namespace DevTools.UI.Control
             GpuInfo info = new GpuInfo();
             try
             {
+                // nvidia-smi 기본 설치 경로 확인
+                string nvidiaPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "nvidia-smi.exe");
+        
+                // 시스템 폴더(System32)에 없다면 Program Files 확인
+                if (!File.Exists(nvidiaPath))
+                {
+                     nvidiaPath = @"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe";
+                }
+
+                // 그래도 없으면 단순히 명령어로 시도
+                if (!File.Exists(nvidiaPath))
+                {
+                    nvidiaPath = "nvidia-smi";
+                }
+
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
-                    FileName = "nvidia-smi",
+                    FileName = nvidiaPath,
                     // 출력 형식: load, memory.used, memory.total
                     Arguments = "--query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits",
                     RedirectStandardOutput = true,
@@ -111,7 +128,9 @@ namespace DevTools.UI.Control
                     using (System.IO.StreamReader reader = process.StandardOutput)
                     {
                         string result = reader.ReadToEnd();
-                        // 결과 예시: "45, 6000, 8192"
+                        // 디버깅용: 출력값이 비어있는지 확인
+                        // System.Diagnostics.Debug.WriteLine($"GPU Output: {result}");
+
                         if (!string.IsNullOrWhiteSpace(result))
                         {
                             string[] parts = result.Split(',');
@@ -125,9 +144,10 @@ namespace DevTools.UI.Control
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // nvidia-smi가 없거나 오류 발생 시 무시 (0 반환)
+                // 오류 발생 시 디버그 출력창에 원인 표시
+                System.Diagnostics.Debug.WriteLine($"GPU Info Error: {ex.Message}");
             }
             return info;
         }
@@ -216,7 +236,7 @@ namespace DevTools.UI.Control
 
                 if (mproAiThink != null)
                 {
-                    mproAiThink.Visible = true;
+                    layAiThink.Visibility = DevExpress.XtraLayout.Utils.LayoutVisibility.Always;
                     mproAiThink.Properties.Stopped = false;
                 }
                 
@@ -339,7 +359,7 @@ Translate all your responses into professional Korean.";
                 if (mproAiThink != null)
                 {
                     mproAiThink.Properties.Stopped = true; // 애니메이션 멈춤
-                    mproAiThink.Visible = false;           // 숨김 (필요 시 true로 유지)
+                    layAiThink.Visibility = DevExpress.XtraLayout.Utils.LayoutVisibility.Never;
                 }
 
                 btnAnalyze.Enabled = true;
@@ -378,7 +398,6 @@ Translate all your responses into professional Korean.";
         {
             Document doc = txtResult.Document;
             doc.AppendText("\r\n──────────────────────────────────────────────────\r\n");
-
 
             DocumentRange range = doc.AppendText($"[{role}] ");
             CharacterProperties cp = doc.BeginUpdateCharacters(range);
